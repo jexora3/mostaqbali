@@ -1,7 +1,14 @@
 
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import { Message, Grade } from '../types';
 import { getGeminiResponse } from '../geminiService';
+
+// Extend Window interface for Prism
+declare global {
+  interface Window {
+    Prism: any;
+  }
+}
 
 interface ChatInterfaceProps {
   grade: Grade;
@@ -9,134 +16,197 @@ interface ChatInterfaceProps {
   isDarkMode: boolean;
 }
 
+// Optimized Message Item Component to prevent re-renders of the entire list
+const MessageItem = React.memo(({ m, i, isDarkMode, onCopy, copiedIndex }: { 
+  m: Message, 
+  i: number, 
+  isDarkMode: boolean, 
+  onCopy: (text: string, index: number) => void,
+  copiedIndex: number | null
+}) => {
+  const isUser = m.role === 'user';
+  
+  // Format content only once or when content changes
+  const formattedContent = useMemo(() => {
+    if (m.role !== 'assistant') return m.content;
+    const parts = m.content.split(/(```[\s\S]*?```)/g);
+    return parts.map((part, index) => {
+      if (part.startsWith('```')) {
+        const match = part.match(/```(\w+)?\n([\s\S]*?)```/);
+        const lang = match?.[1] || 'javascript';
+        const code = match?.[2] || part.slice(3, -3);
+        return (
+          <pre key={index} className={`language-${lang} rounded-xl overflow-hidden my-2 shadow-inner`}>
+            <code className={`language-${lang}`}>{code.trim()}</code>
+          </pre>
+        );
+      }
+      return <span key={index}>{part}</span>;
+    });
+  }, [m.content, m.role]);
+
+  return (
+    <div className={`flex ${isUser ? 'justify-start' : 'justify-end'} mb-4 will-change-transform animate-pop`}>
+      <div className={`relative group max-w-[88%] md:max-w-[75%] p-4 rounded-[22px] shadow-sm text-right transition-all duration-200 ${
+        isUser 
+        ? 'bg-[#00ced1] text-white rounded-tr-none' 
+        : `${isDarkMode ? 'bg-slate-800 text-white' : 'bg-white text-slate-800'} border border-[#b2ebec] rounded-tl-none`
+      }`}>
+        <button
+          onClick={() => onCopy(m.content, i)}
+          className={`absolute top-2 ${isUser ? 'right-2' : 'left-2'} opacity-0 group-hover:opacity-100 transition-opacity duration-200 bg-black/10 hover:bg-black/20 backdrop-blur-sm w-7 h-7 rounded-lg flex items-center justify-center text-[10px] z-10 ${copiedIndex === i ? 'text-green-400' : 'text-current'}`}
+          title="نسخ"
+        >
+          <i className={`fa-solid ${copiedIndex === i ? 'fa-check' : 'fa-copy'}`}></i>
+        </button>
+
+        <div className="text-sm md:text-base font-medium leading-relaxed break-words">
+          {formattedContent}
+        </div>
+      </div>
+    </div>
+  );
+});
+
 const ChatInterface: React.FC<ChatInterfaceProps> = ({ grade, subject, isDarkMode }) => {
   const teacherName = `أستاذ ${subject}`;
   const [messages, setMessages] = useState<Message[]>([
-    { role: 'assistant', content: `أهلاً بك يا بطل! أنا ${teacherName}، كيف يمكنني مساعدتك في التفوق اليوم؟ يمكنك أيضاً تصوير تمارينك وإرسالها لي.` }
+    { role: 'assistant', content: `أهلاً بك يا بطل! أنا ${teacherName}، كيف أساعدك اليوم؟ 📚✍️` }
   ]);
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
+  const [isProcessingImage, setIsProcessingImage] = useState(false);
   const [selectedImage, setSelectedImage] = useState<string | null>(null);
-  const scrollRef = useRef<HTMLDivElement>(null);
+  const [copiedIndex, setCopiedIndex] = useState<number | null>(null);
+  
+  const chatContainerRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+
+  // Use RequestAnimationFrame for ultra-smooth scrolling
+  const scrollToBottom = useCallback(() => {
+    requestAnimationFrame(() => {
+      messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    });
+  }, []);
 
   useEffect(() => {
-    if (scrollRef.current) {
-      scrollRef.current.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' });
-    }
-  }, [messages, loading]);
+    scrollToBottom();
+    // Batch highlight calls for better performance
+    const timer = setTimeout(() => {
+      // Fix: Check window.Prism using type-safe check or cast
+      if (window.Prism && chatContainerRef.current) {
+        window.Prism.highlightAllUnder(chatContainerRef.current);
+      }
+    }, 100);
+    return () => clearTimeout(timer);
+  }, [messages, loading, scrollToBottom]);
 
-  const handleImageSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleImageSelect = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (file) {
+      setIsProcessingImage(true);
       const reader = new FileReader();
       reader.onloadend = () => {
         const base64String = (reader.result as string).split(',')[1];
         setSelectedImage(base64String);
+        setIsProcessingImage(false);
       };
       reader.readAsDataURL(file);
     }
-  };
+  }, []);
+
+  const handleCopy = useCallback((text: string, index: number) => {
+    navigator.clipboard.writeText(text);
+    setCopiedIndex(index);
+    setTimeout(() => setCopiedIndex(null), 1500);
+  }, []);
 
   const handleSend = async () => {
-    if ((!input.trim() && !selectedImage) || loading) return;
+    if ((!input.trim() && !selectedImage) || loading || isProcessingImage) return;
 
-    const userMsg: Message = { 
-      role: 'user', 
-      content: selectedImage ? `[صورة مرفقة] ${input}` : input 
-    };
-    
-    setMessages(prev => [...prev, userMsg]);
-    const currentInput = input;
     const currentImage = selectedImage;
+    const currentInput = input;
+    
+    setMessages(prev => [...prev, { 
+      role: 'user', 
+      content: currentImage ? `[صورة] ${currentInput}` : currentInput 
+    }]);
     
     setInput('');
     setSelectedImage(null);
     setLoading(true);
 
     const response = await getGeminiResponse(currentInput, grade.name, subject, currentImage || undefined);
-    setMessages(prev => [...prev, { role: 'assistant', content: response || "عذراً، حدث خطأ. حاول مرة أخرى." }]);
+    setMessages(prev => [...prev, { role: 'assistant', content: response || "عذراً، حدث خطأ." }]);
     setLoading(false);
   };
 
   return (
-    <div className={`flex flex-col h-full w-full transition-colors ${isDarkMode ? 'bg-slate-900' : 'bg-white'}`}>
-      {/* Header Inside Chat */}
-      <div className="bg-purple-600 p-4 md:p-6 text-white flex items-center justify-between shadow-lg z-10">
-        <div className="flex items-center gap-4 flex-row-reverse">
-          <div className="w-12 h-12 bg-white/20 rounded-full flex items-center justify-center border border-white/30 shadow-inner">
-            <i className="fa-solid fa-user-tie text-xl"></i>
+    <div className={`flex flex-col h-full w-full overflow-hidden ${isDarkMode ? 'bg-slate-950' : 'bg-white'}`}>
+      {/* Optimized sticky header */}
+      <div className="bg-[#00ced1] py-3 px-5 text-white flex items-center justify-between shadow-md shrink-0 z-20">
+        <div className="flex items-center gap-3 flex-row-reverse">
+          <div className="w-10 h-10 bg-white/20 rounded-full flex items-center justify-center border border-white/20">
+            <i className="fa-solid fa-user-tie text-lg"></i>
           </div>
           <div className="text-right">
-            <h3 className="font-bold text-lg leading-none">{teacherName}</h3>
-            <span className="text-[10px] bg-white text-purple-600 px-2 py-0.5 rounded-full font-black mt-1 inline-block">خبير المادة</span>
+            <h3 className="font-bold text-sm leading-none">{teacherName}</h3>
+            <span className="text-[9px] opacity-80 font-bold uppercase tracking-wider">Oustadi AI</span>
           </div>
         </div>
         <div className="flex items-center gap-2">
-            <div className="w-2.5 h-2.5 bg-green-400 rounded-full animate-pulse"></div>
-            <span className="text-xs font-semibold">نشط</span>
+            <div className={`w-2 h-2 rounded-full ${loading ? 'bg-yellow-400 animate-pulse' : 'bg-green-400'}`}></div>
+            <span className="text-[10px] font-bold">{loading ? 'جاري التفكير...' : 'متصل'}</span>
         </div>
       </div>
 
-      {/* Messages Area */}
-      <div ref={scrollRef} className={`flex-1 p-4 md:p-8 overflow-y-auto space-y-6 ${isDarkMode ? 'bg-slate-950' : 'bg-purple-50/10'}`}>
-        {messages.map((m, i) => (
-          <div key={i} className={`flex ${m.role === 'user' ? 'justify-start' : 'justify-end'} animate-pop`}>
-            <div className={`max-w-[85%] md:max-w-[70%] p-4 md:p-5 rounded-[24px] shadow-sm text-right leading-relaxed ${
-              m.role === 'user' 
-              ? 'bg-purple-600 text-white rounded-tr-none' 
-              : `${isDarkMode ? 'bg-slate-800 text-white' : 'bg-white text-slate-800'} border border-purple-100 rounded-tl-none`
-            }`}>
-              <p className="text-sm md:text-base font-semibold whitespace-pre-wrap">{m.content}</p>
-            </div>
-          </div>
-        ))}
+      {/* Main chat area with GPU acceleration */}
+      <div className={`flex-1 overflow-y-auto px-4 py-6 space-y-2 will-change-scroll scroll-smooth ${isDarkMode ? 'bg-slate-900/50' : 'bg-[#e0fbfb]/5'}`}>
+        <div ref={chatContainerRef}>
+          {messages.map((m, i) => (
+            <MessageItem 
+              key={i} 
+              m={m} 
+              i={i} 
+              isDarkMode={isDarkMode} 
+              onCopy={handleCopy} 
+              copiedIndex={copiedIndex} 
+            />
+          ))}
+        </div>
+        
         {loading && (
-          <div className="flex justify-end">
-            <div className={`${isDarkMode ? 'bg-slate-800' : 'bg-white'} px-6 py-4 rounded-full border border-purple-100 shadow-sm flex items-center gap-2`}>
-               <div className="flex gap-1.5">
-                  <div className="w-1.5 h-1.5 bg-purple-500 rounded-full animate-bounce"></div>
-                  <div className="w-1.5 h-1.5 bg-purple-500 rounded-full animate-bounce [animation-delay:0.2s]"></div>
-                  <div className="w-1.5 h-1.5 bg-purple-500 rounded-full animate-bounce [animation-delay:0.4s]"></div>
-               </div>
+          <div className="flex justify-end animate-pulse">
+            <div className={`${isDarkMode ? 'bg-slate-800' : 'bg-white'} px-4 py-2 rounded-full border border-[#b2ebec] shadow-sm`}>
+               <span className="text-[11px] font-black text-[#00ced1]">الأستاذ يحضر الجواب...</span>
             </div>
           </div>
         )}
+        <div ref={messagesEndRef} className="h-4" />
       </div>
 
-      {/* Input Area */}
-      <div className={`p-4 md:p-6 border-t ${isDarkMode ? 'bg-slate-900 border-slate-700' : 'bg-white border-purple-50'}`}>
+      {/* Simplified Footer for speed */}
+      <div className={`p-4 border-t shrink-0 ${isDarkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-[#b2ebec]'}`}>
         {selectedImage && (
-          <div className="mb-4 flex justify-end animate-pop">
-            <div className="relative group">
-              <img 
-                src={`data:image/jpeg;base64,${selectedImage}`} 
-                alt="معاينة" 
-                className="w-24 h-24 object-cover rounded-2xl border-2 border-purple-600 shadow-lg"
-              />
-              <button 
-                onClick={() => setSelectedImage(null)}
-                className="absolute -top-2 -right-2 bg-red-500 text-white w-6 h-6 rounded-full flex items-center justify-center text-xs shadow-md"
-              >
+          <div className="mb-3 flex justify-end">
+            <div className="relative">
+              <img src={`data:image/jpeg;base64,${selectedImage}`} className="w-20 h-24 object-cover rounded-xl border-2 border-[#00ced1]" />
+              <button onClick={() => setSelectedImage(null)} className="absolute -top-2 -right-2 bg-red-500 text-white w-6 h-6 rounded-full text-[10px] shadow-lg border-2 border-white">
                 <i className="fa-solid fa-xmark"></i>
               </button>
             </div>
           </div>
         )}
 
-        <div className={`flex items-center gap-3 rounded-3xl px-5 py-2 border transition-all shadow-sm focus-within:shadow-md focus-within:border-purple-400 ${isDarkMode ? 'bg-slate-800 border-slate-700 text-white' : 'bg-purple-50/50 border-purple-100'}`}>
-          <input
-            type="file"
-            accept="image/*"
-            className="hidden"
-            ref={fileInputRef}
-            onChange={handleImageSelect}
-          />
+        <div className={`flex items-center gap-2 rounded-2xl px-3 py-1 border transition-all ${isDarkMode ? 'bg-slate-800 border-slate-700' : 'bg-[#e0fbfb]/20 border-[#b2ebec]'}`}>
+          <input type="file" accept="image/*" className="hidden" ref={fileInputRef} onChange={handleImageSelect} />
           <button 
             onClick={() => fileInputRef.current?.click()}
-            className="text-purple-600 hover:text-purple-700 transition-colors p-2"
+            disabled={loading || isProcessingImage}
+            className="text-[#00ced1] p-2 hover:scale-110 active:scale-95 transition-transform"
           >
-            <i className="fa-solid fa-camera text-xl"></i>
+            <i className="fa-solid fa-camera text-lg"></i>
           </button>
           
           <input
@@ -144,16 +214,17 @@ const ChatInterface: React.FC<ChatInterfaceProps> = ({ grade, subject, isDarkMod
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={(e) => e.key === 'Enter' && handleSend()}
-            placeholder="اكتب رسالتك هنا أو أرسل صورة تمرين..."
-            className="flex-1 bg-transparent border-none focus:ring-0 text-right text-base font-bold placeholder:text-purple-300 py-3"
+            disabled={loading}
+            placeholder="اسأل أستاذك..."
+            className="flex-1 bg-transparent border-none focus:ring-0 text-right text-sm font-bold placeholder:opacity-40 py-2"
           />
           
           <button 
             onClick={handleSend}
-            disabled={loading}
-            className="w-12 h-12 bg-purple-600 text-white rounded-2xl hover:bg-purple-700 active:scale-95 transition-all flex items-center justify-center disabled:opacity-50"
+            disabled={loading || isProcessingImage || (!input.trim() && !selectedImage)}
+            className="w-10 h-10 bg-[#00ced1] text-white rounded-xl hover:brightness-110 active:scale-90 transition-all flex items-center justify-center disabled:opacity-30"
           >
-            <i className="fa-solid fa-paper-plane text-lg"></i>
+            <i className={`fa-solid ${loading ? 'fa-spinner fa-spin' : 'fa-paper-plane'} text-sm`}></i>
           </button>
         </div>
       </div>
